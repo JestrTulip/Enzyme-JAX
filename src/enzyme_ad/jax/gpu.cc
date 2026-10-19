@@ -59,6 +59,14 @@ XLA_FFI_Error *initialize(XLA_FFI_CallFrame *call_frame) {
   auto internal_api = call_frame->api->internal_api;
   auto ctx = call_frame->ctx;
 
+  // XLA runs the initialize stage once per execution, but the state persists
+  // for the lifetime of the thunk. Only load the module the first time.
+  auto *execution_state = reinterpret_cast<xla::ffi::ExecutionState *>(
+      internal_api->XLA_FFI_INTERNAL_ExecutionState_Get(
+          ctx, XLA_FFI_ExecutionStage_INITIALIZE));
+  if (execution_state->IsSet())
+    return nullptr;
+
   stream_executor::Stream *streamp;
   internal_api->XLA_FFI_INTERNAL_Stream_Get(ctx, (void **)&streamp);
   void *stream = streamp->platform_specific_handle().stream;
@@ -81,9 +89,6 @@ XLA_FFI_Error *initialize(XLA_FFI_CallFrame *call_frame) {
   err = cuCtxPopCurrent(&tctx);
   */
 
-  auto *execution_state = reinterpret_cast<xla::ffi::ExecutionState *>(
-      internal_api->XLA_FFI_INTERNAL_ExecutionState_Get(
-          ctx, XLA_FFI_ExecutionStage_INITIALIZE));
   auto type_id = xla::ffi::TypeRegistry::GetTypeId<CuFuncWrapper>();
   auto type_info = xla::ffi::TypeRegistry::GetTypeInfo(type_id);
   (void)type_info.ok();
@@ -171,4 +176,17 @@ extern "C" MLIR_CAPI_EXPORTED void RegisterEnzymeXLAGPUHandler() {
   xla::ffi::Ffi::RegisterStaticHandler(
       xla::ffi::GetXlaFfiApi(), "enzymexla_compile_gpu_with_error", "CUDA",
       bundle_with_error, /*XLA_FFI_Handler_Traits traits = */ 0);
+
+  xla::ffi::Ffi::RegisterStaticHandler(
+      xla::ffi::GetXlaFfiApi(), "enzymexla_compile_gpu_cmd_buffer_compatible",
+      "CUDA", bundle,
+      static_cast<XLA_FFI_Handler_Traits>(
+          xla::ffi::Traits::kCmdBufferCompatible));
+
+  xla::ffi::Ffi::RegisterStaticHandler(
+      xla::ffi::GetXlaFfiApi(),
+      "enzymexla_compile_gpu_with_error_cmd_buffer_compatible", "CUDA",
+      bundle_with_error,
+      static_cast<XLA_FFI_Handler_Traits>(
+          xla::ffi::Traits::kCmdBufferCompatible));
 }

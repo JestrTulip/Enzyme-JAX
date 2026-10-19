@@ -269,7 +269,7 @@ bool CompileGPUKernel(SymbolTableCollection &symbolTable, mlir::Location loc,
       kcall.getInputs(), kcall.getBackendConfigAttr(),
       kcall.getOperandLayoutsAttr(), kcall.getArgAttrsAttr(),
       kcall.getResAttrsAttr(), kcall.getOutputOperandAliasesAttr(),
-      kcall.getXlaSideEffectFreeAttr());
+      kcall.getXlaSideEffectFreeAttr(), kcall.getCmdBufferCompatibleAttr());
   kcall.replaceAllUsesWith(replacement);
   kcall.erase();
   return true;
@@ -445,7 +445,7 @@ bool CompileCPUKernel(SymbolTableCollection &symbolTable, mlir::Location loc,
       kcall.getInputs(), kcall.getBackendConfigAttr(),
       kcall.getOperandLayoutsAttr(), kcall.getArgAttrsAttr(),
       kcall.getResAttrsAttr(), kcall.getOutputOperandAliasesAttr(),
-      kcall.getXlaSideEffectFreeAttr());
+      kcall.getXlaSideEffectFreeAttr(), kcall.getCmdBufferCompatibleAttr());
   kcall.replaceAllUsesWith(replacement);
   kcall.erase();
   return true;
