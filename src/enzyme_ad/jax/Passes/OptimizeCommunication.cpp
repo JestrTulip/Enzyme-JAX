@@ -744,7 +744,8 @@ Value padWithUndefinedValueInDim(PatternRewriter &rewriter, Location loc,
 
   auto zero = stablehlo::ConstantOp::create(
       rewriter, loc,
-      rewriter.getZeroAttr(RankedTensorType::get({}, RT0.getElementType())));
+      cast<ElementsAttr>(
+          makeAttr(RankedTensorType::get({}, RT0.getElementType()), 0)));
 
   auto pad = stablehlo::PadOp::create(rewriter, loc, val, zero, padLow, padHigh,
                                       padInner);
@@ -1023,8 +1024,9 @@ struct PeriodicConcatSimplify
       needsSlice = true;
     }
     if (needsSlice) {
-      auto cst = stablehlo::ConstantOp::create(rewriter, concat.getLoc(),
-                                               rewriter.getZeroAttr(elemType));
+      auto cst = stablehlo::ConstantOp::create(
+          rewriter, concat.getLoc(),
+          cast<ElementsAttr>(makeAttr(RankedTensorType::get({}, elemType), 0)));
 
       superSliceOp =
           stablehlo::PadOp::create(rewriter, concat.getLoc(), superSliceOp, cst,
@@ -1216,8 +1218,10 @@ struct WrapCommOptimize : public OpRewritePattern<enzymexla::WrapOp> {
     if (needsSlice) {
       inputArg = stablehlo::PadOp::create(
           rewriter, wrap.getLoc(), inputArg,
-          stablehlo::ConstantOp::create(rewriter, wrap.getLoc(),
-                                        rewriter.getZeroAttr(elemType)),
+          stablehlo::ConstantOp::create(
+              rewriter, wrap.getLoc(),
+              cast<ElementsAttr>(
+                  makeAttr(RankedTensorType::get({}, elemType), 0))),
           lowPads, highPads, interior);
     }
     manualOpRetShape[wrapDimension] = paddedResultSize;
@@ -1365,8 +1369,9 @@ struct WrapToPadCommOptimize : public OpRewritePattern<enzymexla::WrapOp> {
                                    rightStarts, rightLimits, strides);
     sdy::setSharding(rightSliceOp, wrapSharding);
 
-    auto zero = stablehlo::ConstantOp::create(rewriter, wrap.getLoc(),
-                                              rewriter.getZeroAttr(elemType));
+    auto zero = stablehlo::ConstantOp::create(
+        rewriter, wrap.getLoc(),
+        cast<ElementsAttr>(makeAttr(RankedTensorType::get({}, elemType), 0)));
 
     SmallVector<int64_t> padLow(ndims, 0);
     SmallVector<int64_t> padHigh(ndims, 0);
@@ -1612,8 +1617,10 @@ struct ExtendCommOptimize : public OpRewritePattern<enzymexla::ExtendOp> {
     if (needsSlice) {
       inputArg = stablehlo::PadOp::create(
           rewriter, extend.getLoc(), inputArg,
-          stablehlo::ConstantOp::create(rewriter, extend.getLoc(),
-                                        rewriter.getZeroAttr(elemType)),
+          stablehlo::ConstantOp::create(
+              rewriter, extend.getLoc(),
+              cast<ElementsAttr>(
+                  makeAttr(RankedTensorType::get({}, elemType), 0))),
           lowPads, highPads, interior);
     }
     manualOpRetShape[extendDimension] = paddedResultSize;
@@ -1761,8 +1768,9 @@ struct ExtendToPadCommOptimize : public OpRewritePattern<enzymexla::ExtendOp> {
         rightLimits, strides);
     sdy::setSharding(rightSliceOp, extendSharding);
 
-    auto zero = stablehlo::ConstantOp::create(rewriter, extend.getLoc(),
-                                              rewriter.getZeroAttr(elemType));
+    auto zero = stablehlo::ConstantOp::create(
+        rewriter, extend.getLoc(),
+        cast<ElementsAttr>(makeAttr(RankedTensorType::get({}, elemType), 0)));
 
     SmallVector<int64_t> padLow(ndims, 0);
     SmallVector<int64_t> padHigh(ndims, 0);
@@ -2005,8 +2013,10 @@ struct RotateCommOptimize : public OpRewritePattern<enzymexla::RotateOp> {
 
       inputArg = stablehlo::PadOp::create(
           rewriter, rotate.getLoc(), rotate.getOperand(),
-          stablehlo::ConstantOp::create(rewriter, rotate.getLoc(),
-                                        rewriter.getZeroAttr(elType)),
+          stablehlo::ConstantOp::create(
+              rewriter, rotate.getLoc(),
+              cast<ElementsAttr>(
+                  makeAttr(RankedTensorType::get({}, elType), 0))),
           padLow, padHigh, padInner);
     }
     if (amount > localShape[rotate.getDimension()]) {
@@ -2030,8 +2040,10 @@ struct RotateCommOptimize : public OpRewritePattern<enzymexla::RotateOp> {
     if (needsSlice) {
       inputArg = stablehlo::PadOp::create(
           rewriter, rotate.getLoc(), rotate.getOperand(),
-          stablehlo::ConstantOp::create(rewriter, rotate.getLoc(),
-                                        rewriter.getZeroAttr(elType)),
+          stablehlo::ConstantOp::create(
+              rewriter, rotate.getLoc(),
+              cast<ElementsAttr>(
+                  makeAttr(RankedTensorType::get({}, elType), 0))),
           lowPads, highPads, interior);
     }
 
@@ -2172,15 +2184,16 @@ struct RotateSpmdOptimize : public OpRewritePattern<enzymexla::RotateOp> {
       SmallVector<Type, 2> resultTypes(rotateAmount + 1, rotate.getType());
 
       // Replace with a custom call
-      auto ccall = rewriter.create<stablehlo::CustomCallOp>(
-          rotate.getLoc(), resultTypes, rotate->getOperands(), fnSym,
+      auto ccall = stablehlo::CustomCallOp::create(
+          rewriter, rotate.getLoc(), resultTypes, rotate->getOperands(), fnSym,
           /*has_side_effect=*/rewriter.getBoolAttr(false),
           /*backend_config=*/rewriter.getStringAttr(opaque),
           /*api_version=*/nullptr,
           /*called_computations=*/nullptr,
           /*operand_layouts=*/nullptr,
           /*result_layouts=*/nullptr,
-          /*output_operand_aliases=*/nullptr);
+          /*output_operand_aliases=*/nullptr,
+          /*result_tilings*/ nullptr);
 
       SmallVector<sdy::TensorShardingAttr> newShardings(rotateAmount + 1,
                                                         rotateSharding);
@@ -2215,15 +2228,16 @@ struct RotateSpmdOptimize : public OpRewritePattern<enzymexla::RotateOp> {
       SmallVector<Type, 2> resultTypes(right_amount + 1, rotate.getType());
 
       // Replace with a custom call
-      auto ccall = rewriter.create<stablehlo::CustomCallOp>(
-          rotate.getLoc(), resultTypes, rotate->getOperands(), fnSym,
+      auto ccall = stablehlo::CustomCallOp::create(
+          rewriter, rotate.getLoc(), resultTypes, rotate->getOperands(), fnSym,
           /*has_side_effect=*/rewriter.getBoolAttr(false),
           /*backend_config=*/rewriter.getStringAttr(opaque),
           /*api_version=*/nullptr,
           /*called_computations=*/nullptr,
           /*operand_layouts=*/nullptr,
           /*result_layouts=*/nullptr,
-          /*output_operand_aliases=*/nullptr);
+          /*output_operand_aliases=*/nullptr,
+          /*result_tilings*/ nullptr);
 
       SmallVector<sdy::TensorShardingAttr> newShardings(right_amount + 1,
                                                         rotateSharding);
@@ -2262,7 +2276,8 @@ struct RotateSpmdOptimize : public OpRewritePattern<enzymexla::RotateOp> {
         /*called_computations=*/nullptr,
         /*operand_layouts=*/nullptr,
         /*result_layouts=*/nullptr,
-        /*output_operand_aliases=*/nullptr);
+        /*output_operand_aliases=*/nullptr,
+        /*result_tilings*/ nullptr);
     mlir::sdy::setShardings(ccall, rotateSharding);
     return success();
   }
@@ -2317,7 +2332,8 @@ struct MultiRotateCustomCallOptimize
         /*called_computations=*/nullptr,
         /*operand_layouts=*/nullptr,
         /*result_layouts=*/nullptr,
-        /*output_operand_aliases=*/nullptr);
+        /*output_operand_aliases=*/nullptr,
+        /*result_tilings*/ nullptr);
     mlir::sdy::setShardings(ccall, TensorShardingPerValueAttr::get(
                                        rewriter.getContext(), opShardings));
     return success();
@@ -2377,7 +2393,8 @@ struct MultiPadCustomCallOptimize
         /*called_computations=*/nullptr,
         /*operand_layouts=*/nullptr,
         /*result_layouts=*/nullptr,
-        /*output_operand_aliases=*/nullptr);
+        /*output_operand_aliases=*/nullptr,
+        /*result_tilings*/ nullptr);
 
     mlir::sdy::setShardings(ccall, TensorShardingPerValueAttr::get(
                                        rewriter.getContext(), opShardings));
@@ -2552,8 +2569,9 @@ struct MultiSliceCustomCallOptimize
         }
       }
 
-      auto preSliceOp = rewriter.create<stablehlo::SliceOp>(
-          slice.getLoc(), customCallOperand, preStart, preLimit, preStrides);
+      auto preSliceOp = stablehlo::SliceOp::create(rewriter, slice.getLoc(),
+                                                   customCallOperand, preStart,
+                                                   preLimit, preStrides);
 
       SmallVector<TensorShardingAttr> opShardings(1, sliceSharding);
       sdy::setShardings(preSliceOp, TensorShardingPerValueAttr::get(
@@ -2588,7 +2606,8 @@ struct MultiSliceCustomCallOptimize
         /*called_computations=*/nullptr,
         /*operand_layouts=*/nullptr,
         /*result_layouts=*/nullptr,
-        /*output_operand_aliases=*/nullptr);
+        /*output_operand_aliases=*/nullptr,
+        /*result_tilings*/ nullptr);
     mlir::sdy::setShardings(ccall, TensorShardingPerValueAttr::get(
                                        rewriter.getContext(), opShardings));
     return success();
@@ -2634,7 +2653,8 @@ struct WrapCustomCallOptimize : public OpRewritePattern<enzymexla::WrapOp> {
         /*called_computations=*/nullptr,
         /*operand_layouts=*/nullptr,
         /*result_layouts=*/nullptr,
-        /*output_operand_aliases=*/nullptr);
+        /*output_operand_aliases=*/nullptr,
+        /*result_tilings*/ nullptr);
     mlir::sdy::setSharding(ccall.getResult(0), rotateSharding);
     return success();
   }
@@ -2684,8 +2704,9 @@ struct RotateToPadCommOptimize : public OpRewritePattern<enzymexla::RotateOp> {
                                           sl1_ends, strides);
     sdy::setSharding(sl1, rotateSharding);
 
-    auto zero = stablehlo::ConstantOp::create(rewriter, rotate.getLoc(),
-                                              rewriter.getZeroAttr(elType));
+    auto zero = stablehlo::ConstantOp::create(
+        rewriter, rotate.getLoc(),
+        cast<ElementsAttr>(makeAttr(RankedTensorType::get({}, elType), 0)));
 
     SmallVector<int64_t> padInner(ndims, 0);
     SmallVector<int64_t> padLow(ndims, 0);
@@ -2788,9 +2809,10 @@ struct MultiRotateSpmdOptimize
 
       auto zero = stablehlo::ConstantOp::create(
           rewriter, rotate.getLoc(),
-          rewriter.getZeroAttr(getElementTypeOrSelf(inputType)));
-      input = rewriter.create<stablehlo::PadOp>(
-          rotate.getLoc(),
+          cast<ElementsAttr>(makeAttr(
+              RankedTensorType::get({}, getElementTypeOrSelf(inputType)), 0)));
+      input = stablehlo::PadOp::create(
+          rewriter, rotate.getLoc(),
           RankedTensorType::get(paddedShape, inputType.getElementType()), input,
           zero, paddingLow, paddingHigh, paddingInterior);
       sdy::setSharding(input, rotateSharding);
@@ -2920,44 +2942,45 @@ struct MultiRotateSpmdOptimize
       // right_amount, shard_size - padding]. We need to conditionally select
       // the start index.
 
-      Value baseStart = rewriter.create<stablehlo::ConstantOp>(
-          rotate.getLoc(),
+      Value baseStart = stablehlo::ConstantOp::create(
+          rewriter, rotate.getLoc(),
           rewriter.getI32IntegerAttr(shard_size - right_amount));
-      Value paddingVal = rewriter.create<stablehlo::ConstantOp>(
-          rotate.getLoc(), rewriter.getI32IntegerAttr(padding));
+      Value paddingVal = stablehlo::ConstantOp::create(
+          rewriter, rotate.getLoc(), rewriter.getI32IntegerAttr(padding));
 
       // Get Partition ID along dimension
       // Inside ManualComputationOp, partition_id returns the index in the
       // manual mesh. Since we have 1 manual axis, this is the scalar index.
-      auto partitionId = rewriter.create<stablehlo::PartitionIdOp>(
-          rotate.getLoc(),
+      auto partitionId = stablehlo::PartitionIdOp::create(
+          rewriter, rotate.getLoc(),
           RankedTensorType::get({}, IntegerType::get(rewriter.getContext(), 32,
                                                      IntegerType::Unsigned)));
 
-      Value dimId = rewriter.create<stablehlo::ConvertOp>(
-          rotate.getLoc(), RankedTensorType::get({}, rewriter.getI32Type()),
-          partitionId);
+      Value dimId = stablehlo::ConvertOp::create(
+          rewriter, rotate.getLoc(),
+          RankedTensorType::get({}, rewriter.getI32Type()), partitionId);
 
-      Value lastShardId = rewriter.create<stablehlo::ConstantOp>(
-          rotate.getLoc(), rewriter.getI32IntegerAttr(total_mesh_size - 1));
+      Value lastShardId = stablehlo::ConstantOp::create(
+          rewriter, rotate.getLoc(),
+          rewriter.getI32IntegerAttr(total_mesh_size - 1));
 
-      Value isLast = rewriter.create<stablehlo::CompareOp>(
-          rotate.getLoc(), dimId, lastShardId,
+      Value isLast = stablehlo::CompareOp::create(
+          rewriter, rotate.getLoc(), dimId, lastShardId,
           stablehlo::ComparisonDirection::EQ);
 
-      Value offset = rewriter.create<stablehlo::SelectOp>(
-          rotate.getLoc(), isLast, paddingVal,
-          rewriter.create<stablehlo::ConstantOp>(
-              rotate.getLoc(), rewriter.getI32IntegerAttr(0)));
+      Value offset = stablehlo::SelectOp::create(
+          rewriter, rotate.getLoc(), isLast, paddingVal,
+          stablehlo::ConstantOp::create(rewriter, rotate.getLoc(),
+                                        rewriter.getI32IntegerAttr(0)));
 
-      Value startIdx = rewriter.create<stablehlo::SubtractOp>(
-          rotate.getLoc(), baseStart, offset);
+      Value startIdx = stablehlo::SubtractOp::create(rewriter, rotate.getLoc(),
+                                                     baseStart, offset);
 
       // Dynamic Slice
       SmallVector<Value> startIndices(
           rotateShape.size(),
-          rewriter.create<stablehlo::ConstantOp>(
-              rotate.getLoc(), rewriter.getI32IntegerAttr(0)));
+          stablehlo::ConstantOp::create(rewriter, rotate.getLoc(),
+                                        rewriter.getI32IntegerAttr(0)));
       startIndices[rotateDimension] = startIdx;
 
       SmallVector<int64_t> sliceSizes(localShape.begin(), localShape.end());
@@ -3033,7 +3056,7 @@ struct MultiRotateSpmdOptimize
       results.push_back(sliced);
     }
 
-    rewriter.create<sdy::ReturnOp>(rotate.getLoc(), results);
+    sdy::ReturnOp::create(rewriter, rotate.getLoc(), results);
 
     rewriter.setInsertionPointAfter(manual);
 
@@ -3158,8 +3181,10 @@ struct ConcatTwoOperandsCommOptimize
       }
       auto paddedOperand = stablehlo::PadOp::create(
           rewriter, concat.getLoc(), allOperands[i],
-          stablehlo::ConstantOp::create(rewriter, concat.getLoc(),
-                                        rewriter.getZeroAttr(elemType)),
+          stablehlo::ConstantOp::create(
+              rewriter, concat.getLoc(),
+              cast<ElementsAttr>(
+                  makeAttr(RankedTensorType::get({}, elemType), 0))),
           padLow, padHigh, padInner);
       sdy::setSharding(paddedOperand, concatSharding);
       allOperands[i] = paddedOperand;
@@ -3436,9 +3461,13 @@ struct DUSToPadComm : public OpRewritePattern<stablehlo::DynamicUpdateSliceOp> {
     }
 
     auto zero = stablehlo::ConstantOp::create(
-        rewriter, dus.getLoc(), rewriter.getZeroAttr(elementType));
-    auto one = stablehlo::ConstantOp::create(rewriter, dus.getLoc(),
-                                             rewriter.getOneAttr(elementType));
+        rewriter, dus.getLoc(),
+        cast<ElementsAttr>(
+            makeAttr(RankedTensorType::get({}, elementType), 0)));
+    auto one = stablehlo::ConstantOp::create(
+        rewriter, dus.getLoc(),
+        cast<ElementsAttr>(
+            makeAttr(RankedTensorType::get({}, elementType), 1)));
 
     SmallVector<int64_t> padInner(ndims, 0);
 
@@ -3461,8 +3490,7 @@ struct DUSToPadComm : public OpRewritePattern<stablehlo::DynamicUpdateSliceOp> {
     Value maskedOperand = nullptr;
     if (!isZero(operand)) {
       auto updateType = cast<RankedTensorType>(update.getType());
-      auto zeroAttr =
-          DenseElementsAttr::get(updateType, rewriter.getZeroAttr(elementType));
+      auto zeroAttr = cast<DenseElementsAttr>(makeAttr(updateType, 0));
       auto zeroUpdateOp = stablehlo::ConstantOp::create(rewriter, dus.getLoc(),
                                                         updateType, zeroAttr);
       sdy::setSharding(zeroUpdateOp, sharding);
@@ -3491,7 +3519,7 @@ struct DUSToPadComm : public OpRewritePattern<stablehlo::DynamicUpdateSliceOp> {
     } else {
       auto cst = stablehlo::ConstantOp::create(
           rewriter, dus.getLoc(), dus.getType(),
-          cast<ElementsAttr>(rewriter.getZeroAttr(dus.getType())));
+          cast<ElementsAttr>(makeAttr(dus.getType(), 0)));
       sdy::setSharding(cst, sharding);
       resultV = cst;
     }
@@ -3997,8 +4025,9 @@ struct ConcatTwoDUSLike : public OpRewritePattern<stablehlo::ConcatenateOp> {
         return failure();
     }
 
-    auto zero = stablehlo::ConstantOp::create(rewriter, concat.getLoc(),
-                                              rewriter.getZeroAttr(elemType));
+    auto zero = stablehlo::ConstantOp::create(
+        rewriter, concat.getLoc(),
+        cast<ElementsAttr>(makeAttr(RankedTensorType::get({}, elemType), 0)));
 
     int64_t leftPadding = 0;
     for (auto [i, operand] : llvm::enumerate(concat.getOperands())) {
@@ -4149,8 +4178,9 @@ struct ExtendDUSLike : public OpRewritePattern<enzymexla::ExtendOp> {
         return failure();
     }
 
-    auto zero = stablehlo::ConstantOp::create(rewriter, concat.getLoc(),
-                                              rewriter.getZeroAttr(elemType));
+    auto zero = stablehlo::ConstantOp::create(
+        rewriter, concat.getLoc(),
+        cast<ElementsAttr>(makeAttr(RankedTensorType::get({}, elemType), 0)));
 
     for (int i = 0; i < 2; i++) {
       auto operand = concat.getOperand();
@@ -4345,8 +4375,8 @@ struct DUSOfConcatSlicesOptimize
         }
       }
 
-      auto newDus = rewriter.create<stablehlo::DynamicUpdateSliceOp>(
-          dus.getLoc(), dus.getType(), current, arg, newIndices);
+      auto newDus = stablehlo::DynamicUpdateSliceOp::create(
+          rewriter, dus.getLoc(), dus.getType(), current, arg, newIndices);
       sdy::setShardings(newDus, sdy::getShardingPerValue(dus));
       current = newDus.getResult();
 
@@ -4657,8 +4687,9 @@ struct ConcatToPadCommOptimize
         return failure();
     }
 
-    auto zero = stablehlo::ConstantOp::create(rewriter, concat.getLoc(),
-                                              rewriter.getZeroAttr(elemType));
+    auto zero = stablehlo::ConstantOp::create(
+        rewriter, concat.getLoc(),
+        cast<ElementsAttr>(makeAttr(RankedTensorType::get({}, elemType), 0)));
 
     int64_t leftPadding = 0;
     for (auto [i, operand] : llvm::enumerate(concat.getOperands())) {
@@ -4685,7 +4716,7 @@ struct ConcatToPadCommOptimize
     if (addOperands.size() == 0) {
       auto cst = stablehlo::ConstantOp::create(
           rewriter, concat.getLoc(), concat.getType(),
-          cast<ElementsAttr>(rewriter.getZeroAttr(concat.getType())));
+          cast<ElementsAttr>(makeAttr(concat.getType(), 0)));
       sdy::setSharding(cst, concatSharding);
       rewriter.replaceOp(concat, cst);
     }

@@ -1,7 +1,8 @@
 #include "Dialect.h"
-
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/TypeSwitch.h"
+
+#include "src/enzyme_ad/jax/Dialect/Tessera/TesseraEnums.cpp.inc"
 
 #define GET_ATTRDEF_CLASSES
 #include "src/enzyme_ad/jax/Dialect/Tessera/TesseraAttrs.cpp.inc"

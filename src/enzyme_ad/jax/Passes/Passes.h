@@ -22,6 +22,7 @@ namespace mlir {
 class PatternRewriter;
 class AffineMap;
 class DominanceInfo;
+class ModuleOp;
 
 namespace stablehlo {
 class SliceOp;
@@ -29,7 +30,9 @@ class SliceOp;
 
 namespace enzyme {
 
-void populateAffineCFGPatterns(RewritePatternSet &rpl);
+void populateAffineCFGPatterns(
+    RewritePatternSet &rpl, bool enable_split_on_affine_if_constants = false);
+void populateInlineNeverLoopingWhilePattern(RewritePatternSet &patterns);
 
 #define GEN_PASS_DECL
 #include "src/enzyme_ad/jax/Passes/Passes.h.inc"
@@ -45,6 +48,8 @@ void addSingleIter(mlir::RewritePatternSet &patterns, mlir::MLIRContext *ctx);
 mlir::AffineExpr recreateExpr(mlir::AffineExpr expr);
 mlir::AffineMap recreateExpr(mlir::AffineMap expr);
 mlir::IntegerSet recreateExpr(mlir::IntegerSet expr);
+std::unique_ptr<OperationPass<ModuleOp>>
+createEnzymeRefineArgumentsPass(TypeRange refinedTypes);
 } // namespace enzyme
 
 namespace cf {
@@ -58,6 +63,13 @@ void fully2ComposeAffineMapAndOperands(
     llvm::SmallVectorImpl<mlir::Value> *operands, mlir::DominanceInfo &DI,
     mlir::Region *scope,
     llvm::SmallVectorImpl<mlir::Operation *> *insertedOps = nullptr);
+// The composition as a question: nothing in the IR moves, and false means an
+// operand would have had to. With `throughSymbols`, an operand that is
+// already a valid symbol is composed through the casts and arithmetic
+// defining it as well, down to values whose definition has no affine form.
+bool fully2ComposeAffineMapAndOperands(
+    mlir::AffineMap *map, llvm::SmallVectorImpl<mlir::Value> *operands,
+    mlir::Region *scope, bool throughSymbols);
 bool isValidIndex(mlir::Value val, mlir::Region *scope);
 mlir::Region *getLocalAffineScope(mlir::Operation *op);
 

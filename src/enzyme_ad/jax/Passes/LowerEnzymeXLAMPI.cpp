@@ -1,5 +1,6 @@
 // #include "mhlo/IR/hlo_ops.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -26,6 +27,44 @@ namespace enzyme {
 } // namespace mlir
 
 using namespace mlir;
+
+static FailureOr<int32_t> mapMPIToNCCLDatatype(enzymexla::MPIDatatype dt) {
+  switch (dt) {
+  case enzymexla::MPIDatatype::MPI_INT32_T:
+  case enzymexla::MPIDatatype::MPI_INT:
+    return 2; // ncclInt32
+  case enzymexla::MPIDatatype::MPI_UINT32_T:
+  case enzymexla::MPIDatatype::MPI_UNSIGNED:
+    return 3; // ncclUint32
+  case enzymexla::MPIDatatype::MPI_INT64_T:
+  case enzymexla::MPIDatatype::MPI_LONG_LONG_INT:
+    return 4; // ncclInt64
+  case enzymexla::MPIDatatype::MPI_UINT64_T:
+  case enzymexla::MPIDatatype::MPI_UNSIGNED_LONG_LONG:
+    return 5; // ncclUint64
+  case enzymexla::MPIDatatype::MPI_FLOAT:
+    return 7; // ncclFloat32
+  case enzymexla::MPIDatatype::MPI_DOUBLE:
+    return 8; // ncclFloat64
+  default:
+    return failure();
+  }
+}
+
+static FailureOr<int32_t> mapMPIToNCCLRedOp(enzymexla::MPIOp op) {
+  switch (op) {
+  case enzymexla::MPIOp::MPI_SUM:
+    return 0; // ncclSum
+  case enzymexla::MPIOp::MPI_PROD:
+    return 1; // ncclProd
+  case enzymexla::MPIOp::MPI_MAX:
+    return 2; // ncclMax
+  case enzymexla::MPIOp::MPI_MIN:
+    return 3; // ncclMin
+  default:
+    return failure();
+  }
+}
 
 struct MPICommRankOpLowering
     : public OpRewritePattern<enzymexla::MPICommRankOp> {
@@ -66,8 +105,8 @@ struct MPICommRankOpLowering
                                         {llvmPtrType}, // pointer parameter
                                         false);        // is variadic: false
 
-        auto wrapperFunc = rewriter.create<LLVM::LLVMFuncOp>(
-            op.getLoc(), wrapperFunctionName, funcType);
+        auto wrapperFunc = LLVM::LLVMFuncOp::create(
+            rewriter, op.getLoc(), wrapperFunctionName, funcType);
 
         // Add function-level memory effects attribute
         auto memoryEffectsAttr = rewriter.getArrayAttr(
@@ -89,17 +128,16 @@ struct MPICommRankOpLowering
         // Get the address of the communicator
         // NOTE these symbols are not ABI-stable until MPI 5.0, but in practice,
         // they are represented as word-size values (i.e. `int` or ptr)
-        Value addressOfComm = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, communicatorName);
+        Value addressOfComm = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, communicatorName);
 
         // TODO error checking
         // MPI_Comm_rank returns i32 error code which we're ignoring here
-        rewriter.create<LLVM::CallOp>(
-            op.getLoc(), TypeRange{i32Type},
-            SymbolRefAttr::get(context, mpiFunctionName),
-            ValueRange{addressOfComm, rankPtr});
+        LLVM::CallOp::create(rewriter, op.getLoc(), TypeRange{i32Type},
+                             SymbolRefAttr::get(context, mpiFunctionName),
+                             ValueRange{addressOfComm, rankPtr});
 
-        rewriter.create<LLVM::ReturnOp>(op.getLoc(), ValueRange{});
+        LLVM::ReturnOp::create(rewriter, op.getLoc(), ValueRange{});
       }
 
       // Insert MPI_Comm_rank function declaration if not already present
@@ -110,8 +148,8 @@ struct MPICommRankOpLowering
         auto funcType = LLVM::LLVMFunctionType::get(
             i32Type, {llvmPtrType, llvmPtrType}, false);
 
-        rewriter.create<LLVM::LLVMFuncOp>(op.getLoc(), mpiFunctionName,
-                                          funcType, LLVM::Linkage::External);
+        LLVM::LLVMFuncOp::create(rewriter, op.getLoc(), mpiFunctionName,
+                                 funcType, LLVM::Linkage::External);
       }
 
       // Insert MPI_COMM_WORLD declaration if not already present
@@ -119,20 +157,20 @@ struct MPICommRankOpLowering
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(
-            op.getLoc(), llvmPtrType,
-            /*isConstant=*/true, LLVM::Linkage::External, communicatorName,
-            /*value=*/Attribute(),
-            /*alignment=*/0,
-            /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               communicatorName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Create a constant tensor to hold the result
       auto tensorType = llvm::cast<RankedTensorType>(op->getResultTypes()[0]);
       auto constantAttr =
           DenseIntElementsAttr::get(tensorType, ArrayRef<int32_t>{-1});
-      Value constantTensor = rewriter.create<stablehlo::ConstantOp>(
-          op.getLoc(), tensorType, constantAttr);
+      Value constantTensor = stablehlo::ConstantOp::create(
+          rewriter, op.getLoc(), tensorType, constantAttr);
 
       // Call the LLVM function with enzymexla.jit_call
       auto aliasAttr = stablehlo::OutputOperandAliasAttr::get(
@@ -141,12 +179,11 @@ struct MPICommRankOpLowering
           /*operandIndex=*/0,
           /*operandTupleIndices=*/ArrayRef<int64_t>{});
 
-      auto jitCall = rewriter.create<enzymexla::JITCallOp>(
-          op.getLoc(), op->getResultTypes(),
+      auto jitCall = enzymexla::JITCallOp::create(
+          rewriter, op.getLoc(), op->getResultTypes(),
           mlir::FlatSymbolRefAttr::get(context, wrapperFunctionName),
           ValueRange{constantTensor}, rewriter.getStringAttr(""),
           /*operand_layouts=*/nullptr,
-          /*result_layouts=*/nullptr,
           /*arg_attrs=*/nullptr,
           /*res_attrs=*/nullptr,
           /*output_operand_aliases=*/rewriter.getArrayAttr({aliasAttr}),
@@ -202,8 +239,8 @@ struct MPICommSizeOpLowering
                                         {llvmPtrType}, // parameter types
                                         false);        // is variadic: false
 
-        auto wrapperFunc = rewriter.create<LLVM::LLVMFuncOp>(
-            op.getLoc(), wrapperFunctionName, funcType);
+        auto wrapperFunc = LLVM::LLVMFuncOp::create(
+            rewriter, op.getLoc(), wrapperFunctionName, funcType);
 
         // Add function-level memory effects attribute
         auto memoryEffectsAttr = rewriter.getArrayAttr(
@@ -225,17 +262,16 @@ struct MPICommSizeOpLowering
         // Get the address of the communicator
         // NOTE these symbols are not ABI-stable until MPI 5.0, but in practice,
         // they are represented as w ord-size values (i.e. `int` or ptr)
-        Value addressOfComm = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, communicatorName);
+        Value addressOfComm = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, communicatorName);
 
         // TODO error checking
         // MPI_Comm_size returns i32 error code which we're ignoring here
-        rewriter.create<LLVM::CallOp>(
-            op.getLoc(), TypeRange{i32Type},
-            SymbolRefAttr::get(context, mpiFunctionName),
-            ValueRange{addressOfComm, sizePtr});
+        LLVM::CallOp::create(rewriter, op.getLoc(), TypeRange{i32Type},
+                             SymbolRefAttr::get(context, mpiFunctionName),
+                             ValueRange{addressOfComm, sizePtr});
 
-        rewriter.create<LLVM::ReturnOp>(op.getLoc(), ValueRange{});
+        LLVM::ReturnOp::create(rewriter, op.getLoc(), ValueRange{});
       }
 
       // Insert MPI_Comm_size function declaration if not already present
@@ -246,8 +282,8 @@ struct MPICommSizeOpLowering
         auto funcType = LLVM::LLVMFunctionType::get(
             i32Type, {llvmPtrType, llvmPtrType}, false);
 
-        rewriter.create<LLVM::LLVMFuncOp>(op.getLoc(), mpiFunctionName,
-                                          funcType, LLVM::Linkage::External);
+        LLVM::LLVMFuncOp::create(rewriter, op.getLoc(), mpiFunctionName,
+                                 funcType, LLVM::Linkage::External);
       }
 
       // Insert MPI_COMM_WORLD declaration if not already present
@@ -255,20 +291,20 @@ struct MPICommSizeOpLowering
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(
-            op.getLoc(), llvmPtrType,
-            /*isConstant=*/true, LLVM::Linkage::External, communicatorName,
-            /*value=*/Attribute(),
-            /*alignment=*/0,
-            /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               communicatorName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Create a constant tensor to hold the result
       auto tensorType = llvm::cast<RankedTensorType>(op->getResultTypes()[0]);
       auto constantAttr =
           DenseIntElementsAttr::get(tensorType, ArrayRef<int32_t>{-1});
-      Value constantTensor = rewriter.create<stablehlo::ConstantOp>(
-          op.getLoc(), tensorType, constantAttr);
+      Value constantTensor = stablehlo::ConstantOp::create(
+          rewriter, op.getLoc(), tensorType, constantAttr);
 
       // Call the LLVM function with enzymexla.jit_call
       SmallVector<Attribute> aliases;
@@ -278,12 +314,11 @@ struct MPICommSizeOpLowering
           /*operand_index=*/0,
           /*operand_tuple_indices=*/std::vector<int64_t>{}));
 
-      auto jitCall = rewriter.create<enzymexla::JITCallOp>(
-          op.getLoc(), op->getResultTypes(),
+      auto jitCall = enzymexla::JITCallOp::create(
+          rewriter, op.getLoc(), op->getResultTypes(),
           mlir::FlatSymbolRefAttr::get(context, wrapperFunctionName),
           ValueRange{constantTensor}, rewriter.getStringAttr(""),
           /*operand_layouts=*/nullptr,
-          /*result_layouts=*/nullptr,
           /*arg_attrs=*/nullptr,
           /*res_attrs=*/nullptr,
           /*output_operand_aliases=*/rewriter.getArrayAttr(aliases),
@@ -334,8 +369,8 @@ struct MPIBarrierOpLowering : public OpRewritePattern<enzymexla::MPIBarrierOp> {
         // Create the function type
         auto funcType = LLVM::LLVMFunctionType::get(llvmVoidType, {}, false);
 
-        auto wrapperFunc = rewriter.create<LLVM::LLVMFuncOp>(
-            op.getLoc(), wrapperFunctionName, funcType);
+        auto wrapperFunc = LLVM::LLVMFuncOp::create(
+            rewriter, op.getLoc(), wrapperFunctionName, funcType);
 
         // Add function-level memory effects attribute
         auto memoryEffectsAttr = rewriter.getArrayAttr(
@@ -350,18 +385,17 @@ struct MPIBarrierOpLowering : public OpRewritePattern<enzymexla::MPIBarrierOp> {
         // Get the address of the communicator
         // NOTE these symbols are not ABI-stable until MPI 5.0, but in practice,
         // they are represented as w ord-size values (i.e. `int` or ptr)
-        Value addressOfComm = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, communicatorName);
+        Value addressOfComm = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, communicatorName);
 
         // Call MPI_Barrier
         // int MPI_Barrier(MPI_Comm comm)
         // TODO returns i32 error code which we're ignoring here
-        rewriter.create<LLVM::CallOp>(
-            op.getLoc(), TypeRange{i32Type},
-            SymbolRefAttr::get(context, mpiFunctionName),
-            ValueRange{addressOfComm});
+        LLVM::CallOp::create(rewriter, op.getLoc(), TypeRange{i32Type},
+                             SymbolRefAttr::get(context, mpiFunctionName),
+                             ValueRange{addressOfComm});
 
-        rewriter.create<LLVM::ReturnOp>(op.getLoc(), ValueRange{});
+        LLVM::ReturnOp::create(rewriter, op.getLoc(), ValueRange{});
       }
 
       // Insert MPI_Barrier function declaration if not already present
@@ -372,8 +406,8 @@ struct MPIBarrierOpLowering : public OpRewritePattern<enzymexla::MPIBarrierOp> {
         auto funcType =
             LLVM::LLVMFunctionType::get(i32Type, {llvmPtrType}, false);
 
-        rewriter.create<LLVM::LLVMFuncOp>(op.getLoc(), mpiFunctionName,
-                                          funcType, LLVM::Linkage::External);
+        LLVM::LLVMFuncOp::create(rewriter, op.getLoc(), mpiFunctionName,
+                                 funcType, LLVM::Linkage::External);
       }
 
       // Insert MPI_COMM_WORLD declaration if not already present
@@ -381,21 +415,20 @@ struct MPIBarrierOpLowering : public OpRewritePattern<enzymexla::MPIBarrierOp> {
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(
-            op.getLoc(), llvmPtrType,
-            /*isConstant=*/true, LLVM::Linkage::External, communicatorName,
-            /*value=*/Attribute(),
-            /*alignment=*/0,
-            /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               communicatorName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Call the LLVM function with enzymexla.jit_call
-      rewriter.create<enzymexla::JITCallOp>(
-          op.getLoc(), TypeRange{},
+      enzymexla::JITCallOp::create(
+          rewriter, op.getLoc(), TypeRange{},
           mlir::FlatSymbolRefAttr::get(context, wrapperFunctionName),
           ValueRange{}, rewriter.getStringAttr(""),
           /*operand_layouts=*/nullptr,
-          /*result_layouts=*/nullptr,
           /*arg_attrs=*/nullptr,
           /*res_attrs=*/nullptr,
           /*output_operand_aliases=*/nullptr,
@@ -454,8 +487,8 @@ struct MPISendOpLowering : public OpRewritePattern<enzymexla::MPISendOp> {
             llvmVoidType, {llvmPtrType, llvmPtrType, llvmPtrType, llvmPtrType},
             false);
 
-        auto wrapperFunc = rewriter.create<LLVM::LLVMFuncOp>(
-            op.getLoc(), wrapperFunctionName, funcType);
+        auto wrapperFunc = LLVM::LLVMFuncOp::create(
+            rewriter, op.getLoc(), wrapperFunctionName, funcType);
 
         // Add function-level memory effects attribute
         auto memoryEffectsAttr = rewriter.getArrayAttr(
@@ -481,34 +514,34 @@ struct MPISendOpLowering : public OpRewritePattern<enzymexla::MPISendOp> {
 
         // Load the count, dest, tag values
         Value count =
-            rewriter.create<LLVM::LoadOp>(op.getLoc(), i32Type, countPtr);
+            LLVM::LoadOp::create(rewriter, op.getLoc(), i32Type, countPtr);
 
         Value dest =
-            rewriter.create<LLVM::LoadOp>(op.getLoc(), i32Type, destPtr);
+            LLVM::LoadOp::create(rewriter, op.getLoc(), i32Type, destPtr);
 
-        Value tag = rewriter.create<LLVM::LoadOp>(op.getLoc(), i32Type, tagPtr);
+        Value tag =
+            LLVM::LoadOp::create(rewriter, op.getLoc(), i32Type, tagPtr);
 
         // Get the address of the datatype
         // NOTE these symbols are not ABI-stable until MPI 5.0, but in practice,
         // they are represented as w ord-size values (i.e. `int` or ptr)
-        Value addressOfDtype = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, datatypeName);
+        Value addressOfDtype = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, datatypeName);
 
         // Get the address of the communicator
-        Value addressOfComm = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, communicatorName);
+        Value addressOfComm = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, communicatorName);
 
         // Call MPI_Send
         // int MPI_Send(const void* buf, int count, MPI_Datatype datatype, int
         //     dest, int tag, MPI_Comm comm)
         // TODO returns i32 error code which we're ignoring here
-        rewriter.create<LLVM::CallOp>(
-            op.getLoc(), TypeRange{i32Type},
-            SymbolRefAttr::get(context, mpiFunctionName),
-            ValueRange{bufPtr, count, addressOfDtype, dest, tag,
-                       addressOfComm});
+        LLVM::CallOp::create(rewriter, op.getLoc(), TypeRange{i32Type},
+                             SymbolRefAttr::get(context, mpiFunctionName),
+                             ValueRange{bufPtr, count, addressOfDtype, dest,
+                                        tag, addressOfComm});
 
-        rewriter.create<LLVM::ReturnOp>(op.getLoc(), ValueRange{});
+        LLVM::ReturnOp::create(rewriter, op.getLoc(), ValueRange{});
       }
 
       // Insert MPI_Send function declaration if not already present
@@ -521,8 +554,8 @@ struct MPISendOpLowering : public OpRewritePattern<enzymexla::MPISendOp> {
             {llvmPtrType, i32Type, llvmPtrType, i32Type, i32Type, llvmPtrType},
             false);
 
-        rewriter.create<LLVM::LLVMFuncOp>(op.getLoc(), mpiFunctionName,
-                                          funcType, LLVM::Linkage::External);
+        LLVM::LLVMFuncOp::create(rewriter, op.getLoc(), mpiFunctionName,
+                                 funcType, LLVM::Linkage::External);
       }
 
       // Insert MPI_COMM_WORLD declaration if not already present
@@ -530,12 +563,12 @@ struct MPISendOpLowering : public OpRewritePattern<enzymexla::MPISendOp> {
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(
-            op.getLoc(), llvmPtrType,
-            /*isConstant=*/true, LLVM::Linkage::External, communicatorName,
-            /*value=*/Attribute(),
-            /*alignment=*/0,
-            /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               communicatorName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Insert datatype declaration if not already present
@@ -543,24 +576,23 @@ struct MPISendOpLowering : public OpRewritePattern<enzymexla::MPISendOp> {
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(op.getLoc(), llvmPtrType,
-                                        /*isConstant=*/true,
-                                        LLVM::Linkage::External, datatypeName,
-                                        /*value=*/Attribute(),
-                                        /*alignment=*/0,
-                                        /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               datatypeName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Get all orinigal op operands
       auto operands = op.getOperands();
 
       // Call the LLVM function with enzymexla.jit_call
-      rewriter.create<enzymexla::JITCallOp>(
-          op.getLoc(), TypeRange{},
+      enzymexla::JITCallOp::create(
+          rewriter, op.getLoc(), TypeRange{},
           mlir::FlatSymbolRefAttr::get(context, wrapperFunctionName),
           ValueRange{operands}, rewriter.getStringAttr(""),
           /*operand_layouts=*/nullptr,
-          /*result_layouts=*/nullptr,
           /*arg_attrs=*/nullptr,
           /*res_attrs=*/nullptr,
           /*output_operand_aliases=*/nullptr,
@@ -621,8 +653,8 @@ struct MPIRecvOpLowering : public OpRewritePattern<enzymexla::MPIRecvOp> {
             llvmVoidType, {llvmPtrType, llvmPtrType, llvmPtrType, llvmPtrType},
             false);
 
-        auto wrapperFunc = rewriter.create<LLVM::LLVMFuncOp>(
-            op.getLoc(), wrapperFunctionName, funcType);
+        auto wrapperFunc = LLVM::LLVMFuncOp::create(
+            rewriter, op.getLoc(), wrapperFunctionName, funcType);
 
         // Add function-level memory effects attribute
         auto memoryEffectsAttr = rewriter.getArrayAttr(
@@ -648,37 +680,38 @@ struct MPIRecvOpLowering : public OpRewritePattern<enzymexla::MPIRecvOp> {
 
         // Load the count, src, tag values
         Value count =
-            rewriter.create<LLVM::LoadOp>(op.getLoc(), i32Type, countPtr);
+            LLVM::LoadOp::create(rewriter, op.getLoc(), i32Type, countPtr);
 
-        Value src = rewriter.create<LLVM::LoadOp>(op.getLoc(), i32Type, srcPtr);
+        Value src =
+            LLVM::LoadOp::create(rewriter, op.getLoc(), i32Type, srcPtr);
 
-        Value tag = rewriter.create<LLVM::LoadOp>(op.getLoc(), i32Type, tagPtr);
+        Value tag =
+            LLVM::LoadOp::create(rewriter, op.getLoc(), i32Type, tagPtr);
 
         // Get the address of the datatype
         // NOTE these symbols are not ABI-stable until MPI 5.0, but in practice,
         // they are represented as w ord-size values (i.e. `int` or ptr)
-        Value addressOfDtype = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, datatypeName);
+        Value addressOfDtype = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, datatypeName);
 
         // Get the address of the communicator
-        Value addressOfComm = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, communicatorName);
+        Value addressOfComm = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, communicatorName);
 
         // Get the address of the status
-        Value addressOfStatus = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, statusName);
+        Value addressOfStatus = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, statusName);
 
         // Call MPI_Recv
         // int MPI_Recv(void* buf, int count, MPI_Datatype datatype, int
         //     source, int tag, MPI_Comm comm, MPI_Status* status)
         // TODO returns i32 error code which we're ignoring here
-        rewriter.create<LLVM::CallOp>(
-            op.getLoc(), TypeRange{i32Type},
-            SymbolRefAttr::get(context, mpiFunctionName),
-            ValueRange{bufPtr, count, addressOfDtype, src, tag, addressOfComm,
-                       addressOfStatus});
+        LLVM::CallOp::create(rewriter, op.getLoc(), TypeRange{i32Type},
+                             SymbolRefAttr::get(context, mpiFunctionName),
+                             ValueRange{bufPtr, count, addressOfDtype, src, tag,
+                                        addressOfComm, addressOfStatus});
 
-        rewriter.create<LLVM::ReturnOp>(op.getLoc(), ValueRange{});
+        LLVM::ReturnOp::create(rewriter, op.getLoc(), ValueRange{});
       }
 
       // Insert MPI_Recv function declaration if not already present
@@ -692,8 +725,8 @@ struct MPIRecvOpLowering : public OpRewritePattern<enzymexla::MPIRecvOp> {
              llvmPtrType},
             false);
 
-        rewriter.create<LLVM::LLVMFuncOp>(op.getLoc(), mpiFunctionName,
-                                          funcType, LLVM::Linkage::External);
+        LLVM::LLVMFuncOp::create(rewriter, op.getLoc(), mpiFunctionName,
+                                 funcType, LLVM::Linkage::External);
       }
 
       // Insert MPI_STATUS_IGNORE declaration if not already present
@@ -701,12 +734,12 @@ struct MPIRecvOpLowering : public OpRewritePattern<enzymexla::MPIRecvOp> {
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(op.getLoc(), llvmPtrType,
-                                        /*isConstant=*/true,
-                                        LLVM::Linkage::External, statusName,
-                                        /*value=*/Attribute(),
-                                        /*alignment=*/0,
-                                        /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               statusName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Insert MPI_COMM_WORLD declaration if not already present
@@ -714,12 +747,12 @@ struct MPIRecvOpLowering : public OpRewritePattern<enzymexla::MPIRecvOp> {
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(
-            op.getLoc(), llvmPtrType,
-            /*isConstant=*/true, LLVM::Linkage::External, communicatorName,
-            /*value=*/Attribute(),
-            /*alignment=*/0,
-            /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               communicatorName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Insert datatype declaration if not already present
@@ -727,12 +760,12 @@ struct MPIRecvOpLowering : public OpRewritePattern<enzymexla::MPIRecvOp> {
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(op.getLoc(), llvmPtrType,
-                                        /*isConstant=*/true,
-                                        LLVM::Linkage::External, datatypeName,
-                                        /*value=*/Attribute(),
-                                        /*alignment=*/0,
-                                        /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               datatypeName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Get all orinigal op operands
@@ -746,12 +779,11 @@ struct MPIRecvOpLowering : public OpRewritePattern<enzymexla::MPIRecvOp> {
           /*operand_index=*/0,
           /*operand_tuple_indices=*/std::vector<int64_t>{}));
 
-      auto jitCall = rewriter.create<enzymexla::JITCallOp>(
-          op.getLoc(), op->getResultTypes(),
+      auto jitCall = enzymexla::JITCallOp::create(
+          rewriter, op.getLoc(), op->getResultTypes(),
           mlir::FlatSymbolRefAttr::get(context, wrapperFunctionName),
           ValueRange{operands}, rewriter.getStringAttr(""),
           /*operand_layouts=*/nullptr,
-          /*result_layouts=*/nullptr,
           /*arg_attrs=*/nullptr,
           /*res_attrs=*/nullptr,
           /*output_operand_aliases=*/rewriter.getArrayAttr(aliases),
@@ -810,8 +842,8 @@ struct MPIIsendOpLowering : public OpRewritePattern<enzymexla::MPIIsendOp> {
             {llvmPtrType, llvmPtrType, llvmPtrType, llvmPtrType, llvmPtrType},
             false);
 
-        auto wrapperFunc = rewriter.create<LLVM::LLVMFuncOp>(
-            op.getLoc(), wrapperFunctionName, funcType);
+        auto wrapperFunc = LLVM::LLVMFuncOp::create(
+            rewriter, op.getLoc(), wrapperFunctionName, funcType);
 
         // Add function-level memory effects attribute
         auto memoryEffectsAttr = rewriter.getArrayAttr(
@@ -838,34 +870,34 @@ struct MPIIsendOpLowering : public OpRewritePattern<enzymexla::MPIIsendOp> {
 
         // Load the count, dest, tag values
         Value count =
-            rewriter.create<LLVM::LoadOp>(op.getLoc(), i32Type, countPtr);
+            LLVM::LoadOp::create(rewriter, op.getLoc(), i32Type, countPtr);
 
         Value dest =
-            rewriter.create<LLVM::LoadOp>(op.getLoc(), i32Type, destPtr);
+            LLVM::LoadOp::create(rewriter, op.getLoc(), i32Type, destPtr);
 
-        Value tag = rewriter.create<LLVM::LoadOp>(op.getLoc(), i32Type, tagPtr);
+        Value tag =
+            LLVM::LoadOp::create(rewriter, op.getLoc(), i32Type, tagPtr);
 
         // Get the address of the datatype
         // NOTE these symbols are not ABI-stable until MPI 5.0, but in practice,
         // they are represented as w ord-size values (i.e. `int` or ptr)
-        Value addressOfDtype = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, datatypeName);
+        Value addressOfDtype = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, datatypeName);
 
         // Get the address of the communicator
-        Value addressOfComm = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, communicatorName);
+        Value addressOfComm = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, communicatorName);
 
         // Call MPI_Isend
         // int MPI_Isend(void* buf, int count, MPI_Datatype datatype, int
         //               dest, int tag, MPI_Comm comm, MPI_Request* request)
         // TODO returns i32 error code which we're ignoring here
-        rewriter.create<LLVM::CallOp>(
-            op.getLoc(), TypeRange{i32Type},
-            SymbolRefAttr::get(context, mpiFunctionName),
-            ValueRange{bufPtr, count, addressOfDtype, dest, tag, addressOfComm,
-                       requestPtr});
+        LLVM::CallOp::create(rewriter, op.getLoc(), TypeRange{i32Type},
+                             SymbolRefAttr::get(context, mpiFunctionName),
+                             ValueRange{bufPtr, count, addressOfDtype, dest,
+                                        tag, addressOfComm, requestPtr});
 
-        rewriter.create<LLVM::ReturnOp>(op.getLoc(), ValueRange{});
+        LLVM::ReturnOp::create(rewriter, op.getLoc(), ValueRange{});
       }
 
       // Insert MPI_Isend function declaration if not already present
@@ -879,8 +911,8 @@ struct MPIIsendOpLowering : public OpRewritePattern<enzymexla::MPIIsendOp> {
              llvmPtrType},
             false);
 
-        rewriter.create<LLVM::LLVMFuncOp>(op.getLoc(), mpiFunctionName,
-                                          funcType, LLVM::Linkage::External);
+        LLVM::LLVMFuncOp::create(rewriter, op.getLoc(), mpiFunctionName,
+                                 funcType, LLVM::Linkage::External);
       }
 
       // Insert MPI_COMM_WORLD declaration if not already present
@@ -888,12 +920,12 @@ struct MPIIsendOpLowering : public OpRewritePattern<enzymexla::MPIIsendOp> {
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(
-            op.getLoc(), llvmPtrType,
-            /*isConstant=*/true, LLVM::Linkage::External, communicatorName,
-            /*value=*/Attribute(),
-            /*alignment=*/0,
-            /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               communicatorName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Insert datatype declaration if not already present
@@ -901,12 +933,12 @@ struct MPIIsendOpLowering : public OpRewritePattern<enzymexla::MPIIsendOp> {
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(op.getLoc(), llvmPtrType,
-                                        /*isConstant=*/true,
-                                        LLVM::Linkage::External, datatypeName,
-                                        /*value=*/Attribute(),
-                                        /*alignment=*/0,
-                                        /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               datatypeName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Get all orinigal op operands
@@ -916,8 +948,8 @@ struct MPIIsendOpLowering : public OpRewritePattern<enzymexla::MPIIsendOp> {
       auto tensorType = RankedTensorType::get({}, i32Type);
       auto constantAttr =
           DenseIntElementsAttr::get(tensorType, ArrayRef<int32_t>{-1});
-      Value constantTensor = rewriter.create<stablehlo::ConstantOp>(
-          op.getLoc(), tensorType, constantAttr);
+      Value constantTensor = stablehlo::ConstantOp::create(
+          rewriter, op.getLoc(), tensorType, constantAttr);
 
       // Combine all operands
       SmallVector<Value> jitCallOperands(opOperands.begin(), opOperands.end());
@@ -932,12 +964,11 @@ struct MPIIsendOpLowering : public OpRewritePattern<enzymexla::MPIIsendOp> {
           /*operand_tuple_indices=*/std::vector<int64_t>{}));
 
       // Call the LLVM function with enzymexla.jit_call
-      auto jitCall = rewriter.create<enzymexla::JITCallOp>(
-          op.getLoc(), op->getResultTypes(),
+      auto jitCall = enzymexla::JITCallOp::create(
+          rewriter, op.getLoc(), op->getResultTypes(),
           mlir::FlatSymbolRefAttr::get(context, wrapperFunctionName),
           jitCallOperands, rewriter.getStringAttr(""),
           /*operand_layouts=*/nullptr,
-          /*result_layouts=*/nullptr,
           /*arg_attrs=*/nullptr,
           /*res_attrs=*/nullptr,
           /*output_operand_aliases=*/rewriter.getArrayAttr(aliases),
@@ -997,8 +1028,8 @@ struct MPIIrecvOpLowering : public OpRewritePattern<enzymexla::MPIIrecvOp> {
             {llvmPtrType, llvmPtrType, llvmPtrType, llvmPtrType, llvmPtrType},
             false);
 
-        auto wrapperFunc = rewriter.create<LLVM::LLVMFuncOp>(
-            op.getLoc(), wrapperFunctionName, funcType);
+        auto wrapperFunc = LLVM::LLVMFuncOp::create(
+            rewriter, op.getLoc(), wrapperFunctionName, funcType);
 
         // Add function-level memory effects attribute
         auto memoryEffectsAttr = rewriter.getArrayAttr(
@@ -1025,33 +1056,34 @@ struct MPIIrecvOpLowering : public OpRewritePattern<enzymexla::MPIIrecvOp> {
 
         // Load the count, src, tag values
         Value count =
-            rewriter.create<LLVM::LoadOp>(op.getLoc(), i32Type, countPtr);
+            LLVM::LoadOp::create(rewriter, op.getLoc(), i32Type, countPtr);
 
-        Value src = rewriter.create<LLVM::LoadOp>(op.getLoc(), i32Type, srcPtr);
+        Value src =
+            LLVM::LoadOp::create(rewriter, op.getLoc(), i32Type, srcPtr);
 
-        Value tag = rewriter.create<LLVM::LoadOp>(op.getLoc(), i32Type, tagPtr);
+        Value tag =
+            LLVM::LoadOp::create(rewriter, op.getLoc(), i32Type, tagPtr);
 
         // Get the address of the datatype
         // NOTE these symbols are not ABI-stable until MPI 5.0, but in practice,
         // they are represented as w ord-size values (i.e. `int` or ptr)
-        Value addressOfDtype = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, datatypeName);
+        Value addressOfDtype = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, datatypeName);
 
         // Get the address of the communicator
-        Value addressOfComm = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, communicatorName);
+        Value addressOfComm = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, communicatorName);
 
         // Call MPI_Irecv
         // int MPI_Irecv(void* buf, int count, MPI_Datatype datatype, int
         //               source, int tag, MPI_Comm comm, MPI_Request* request)
         // TODO returns i32 error code which we're ignoring here
-        rewriter.create<LLVM::CallOp>(
-            op.getLoc(), TypeRange{i32Type},
-            SymbolRefAttr::get(context, mpiFunctionName),
-            ValueRange{bufPtr, count, addressOfDtype, src, tag, addressOfComm,
-                       requestPtr});
+        LLVM::CallOp::create(rewriter, op.getLoc(), TypeRange{i32Type},
+                             SymbolRefAttr::get(context, mpiFunctionName),
+                             ValueRange{bufPtr, count, addressOfDtype, src, tag,
+                                        addressOfComm, requestPtr});
 
-        rewriter.create<LLVM::ReturnOp>(op.getLoc(), ValueRange{});
+        LLVM::ReturnOp::create(rewriter, op.getLoc(), ValueRange{});
       }
 
       // Insert MPI_Irecv function declaration if not already present
@@ -1065,8 +1097,8 @@ struct MPIIrecvOpLowering : public OpRewritePattern<enzymexla::MPIIrecvOp> {
              llvmPtrType},
             false);
 
-        rewriter.create<LLVM::LLVMFuncOp>(op.getLoc(), mpiFunctionName,
-                                          funcType, LLVM::Linkage::External);
+        LLVM::LLVMFuncOp::create(rewriter, op.getLoc(), mpiFunctionName,
+                                 funcType, LLVM::Linkage::External);
       }
 
       // Insert MPI_COMM_WORLD declaration if not already present
@@ -1074,12 +1106,12 @@ struct MPIIrecvOpLowering : public OpRewritePattern<enzymexla::MPIIrecvOp> {
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(
-            op.getLoc(), llvmPtrType,
-            /*isConstant=*/true, LLVM::Linkage::External, communicatorName,
-            /*value=*/Attribute(),
-            /*alignment=*/0,
-            /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               communicatorName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Insert datatype declaration if not already present
@@ -1087,12 +1119,12 @@ struct MPIIrecvOpLowering : public OpRewritePattern<enzymexla::MPIIrecvOp> {
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(op.getLoc(), llvmPtrType,
-                                        /*isConstant=*/true,
-                                        LLVM::Linkage::External, datatypeName,
-                                        /*value=*/Attribute(),
-                                        /*alignment=*/0,
-                                        /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               datatypeName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Get all orinigal op operands
@@ -1102,8 +1134,8 @@ struct MPIIrecvOpLowering : public OpRewritePattern<enzymexla::MPIIrecvOp> {
       auto tensorType = RankedTensorType::get({}, i32Type);
       auto constantAttr =
           DenseIntElementsAttr::get(tensorType, ArrayRef<int32_t>{-1});
-      Value constantTensor = rewriter.create<stablehlo::ConstantOp>(
-          op.getLoc(), tensorType, constantAttr);
+      Value constantTensor = stablehlo::ConstantOp::create(
+          rewriter, op.getLoc(), tensorType, constantAttr);
 
       // Combine all operands
       SmallVector<Value> jitCallOperands(opOperands.begin(), opOperands.end());
@@ -1125,12 +1157,11 @@ struct MPIIrecvOpLowering : public OpRewritePattern<enzymexla::MPIIrecvOp> {
           /*operand_tuple_indices=*/std::vector<int64_t>{}));
 
       // Call the LLVM function with enzymexla.jit_call
-      auto jitCall = rewriter.create<enzymexla::JITCallOp>(
-          op.getLoc(), op->getResultTypes(),
+      auto jitCall = enzymexla::JITCallOp::create(
+          rewriter, op.getLoc(), op->getResultTypes(),
           mlir::FlatSymbolRefAttr::get(context, wrapperFunctionName),
           ValueRange{jitCallOperands}, rewriter.getStringAttr(""),
           /*operand_layouts=*/nullptr,
-          /*result_layouts=*/nullptr,
           /*arg_attrs=*/nullptr,
           /*res_attrs=*/nullptr,
           /*output_operand_aliases=*/rewriter.getArrayAttr(aliases),
@@ -1179,8 +1210,8 @@ struct MPIWaitOpLowering : public OpRewritePattern<enzymexla::MPIWaitOp> {
         auto funcType =
             LLVM::LLVMFunctionType::get(llvmVoidType, {llvmPtrType}, false);
 
-        auto wrapperFunc = rewriter.create<LLVM::LLVMFuncOp>(
-            op.getLoc(), wrapperFunctionName, funcType);
+        auto wrapperFunc = LLVM::LLVMFuncOp::create(
+            rewriter, op.getLoc(), wrapperFunctionName, funcType);
 
         // Add function-level memory effects attribute
         auto memoryEffectsAttr = rewriter.getArrayAttr(
@@ -1201,23 +1232,22 @@ struct MPIWaitOpLowering : public OpRewritePattern<enzymexla::MPIWaitOp> {
 
         // Allocate a 1x!llvm.array<6 x i32> that we use in place of MPI_Status
         // Size of status is implem dependendent, this should cover the max
-        Value numElements = rewriter.create<arith::ConstantOp>(
-            op.getLoc(), i32Type, rewriter.getI32IntegerAttr(1));
+        Value numElements = arith::ConstantOp::create(
+            rewriter, op.getLoc(), i32Type, rewriter.getI32IntegerAttr(1));
 
         auto arrayType = LLVM::LLVMArrayType::get(i32Type, 6);
 
-        Value statusPtr = rewriter.create<LLVM::AllocaOp>(
-            op.getLoc(), llvmPtrType, arrayType, numElements);
+        Value statusPtr = LLVM::AllocaOp::create(
+            rewriter, op.getLoc(), llvmPtrType, arrayType, numElements);
 
         // Call MPI_Wait
         // int MPI_Wait(MPI_Request* request, MPI_Status* status)
         // TODO returns i32 error code which we're ignoring here
-        rewriter.create<LLVM::CallOp>(
-            op.getLoc(), TypeRange{i32Type},
-            SymbolRefAttr::get(context, mpiFunctionName),
-            ValueRange{requestPtr, statusPtr});
+        LLVM::CallOp::create(rewriter, op.getLoc(), TypeRange{i32Type},
+                             SymbolRefAttr::get(context, mpiFunctionName),
+                             ValueRange{requestPtr, statusPtr});
 
-        rewriter.create<LLVM::ReturnOp>(op.getLoc(), ValueRange{});
+        LLVM::ReturnOp::create(rewriter, op.getLoc(), ValueRange{});
       }
 
       // Insert MPI_Wait function declaration if not already present
@@ -1228,20 +1258,19 @@ struct MPIWaitOpLowering : public OpRewritePattern<enzymexla::MPIWaitOp> {
         auto funcType = LLVM::LLVMFunctionType::get(
             i32Type, {llvmPtrType, llvmPtrType}, false);
 
-        rewriter.create<LLVM::LLVMFuncOp>(op.getLoc(), mpiFunctionName,
-                                          funcType, LLVM::Linkage::External);
+        LLVM::LLVMFuncOp::create(rewriter, op.getLoc(), mpiFunctionName,
+                                 funcType, LLVM::Linkage::External);
       }
 
       // Get the request operand
       auto request = op.getRequest();
 
       // Call the LLVM function with enzymexla.jit_call
-      rewriter.create<enzymexla::JITCallOp>(
-          op.getLoc(), TypeRange{},
+      enzymexla::JITCallOp::create(
+          rewriter, op.getLoc(), TypeRange{},
           mlir::FlatSymbolRefAttr::get(context, wrapperFunctionName),
           ValueRange{request}, rewriter.getStringAttr(""),
           /*operand_layouts=*/nullptr,
-          /*result_layouts=*/nullptr,
           /*arg_attrs=*/nullptr,
           /*res_attrs=*/nullptr,
           /*output_operand_aliases=*/nullptr,
@@ -1290,8 +1319,8 @@ struct MPIWaitallOpLowering : public OpRewritePattern<enzymexla::MPIWaitallOp> {
         auto funcType = LLVM::LLVMFunctionType::get(
             llvmVoidType, {llvmPtrType, llvmPtrType}, false);
 
-        auto wrapperFunc = rewriter.create<LLVM::LLVMFuncOp>(
-            op.getLoc(), wrapperFunctionName, funcType);
+        auto wrapperFunc = LLVM::LLVMFuncOp::create(
+            rewriter, op.getLoc(), wrapperFunctionName, funcType);
 
         // Add function-level memory effects attribute
         auto memoryEffectsAttr = rewriter.getArrayAttr(
@@ -1315,25 +1344,24 @@ struct MPIWaitallOpLowering : public OpRewritePattern<enzymexla::MPIWaitallOp> {
 
         // Load the count value
         Value count =
-            rewriter.create<LLVM::LoadOp>(op.getLoc(), i32Type, countPtr);
+            LLVM::LoadOp::create(rewriter, op.getLoc(), i32Type, countPtr);
 
         // Allocate a count x !llvm.array<6 x i32> for the array of statuses
         // Size of status is implem dependendent, 6 should cover the max
         auto arrayType = LLVM::LLVMArrayType::get(i32Type, 6);
 
-        Value statusPtr = rewriter.create<LLVM::AllocaOp>(
-            op.getLoc(), llvmPtrType, arrayType, count);
+        Value statusPtr = LLVM::AllocaOp::create(rewriter, op.getLoc(),
+                                                 llvmPtrType, arrayType, count);
 
         // Call MPI_Waitall
         // int MPI_Waitall(int count, MPI_Request array_of_requests[],
         // MPI_Status *array_of_statuses)
         // TODO returns i32 error code which we're ignoring here
-        rewriter.create<LLVM::CallOp>(
-            op.getLoc(), TypeRange{i32Type},
-            SymbolRefAttr::get(context, mpiFunctionName),
-            ValueRange{count, requestPtr, statusPtr});
+        LLVM::CallOp::create(rewriter, op.getLoc(), TypeRange{i32Type},
+                             SymbolRefAttr::get(context, mpiFunctionName),
+                             ValueRange{count, requestPtr, statusPtr});
 
-        rewriter.create<LLVM::ReturnOp>(op.getLoc(), ValueRange{});
+        LLVM::ReturnOp::create(rewriter, op.getLoc(), ValueRange{});
       }
 
       // Insert MPI_Waitall function declaration if not already present
@@ -1344,20 +1372,19 @@ struct MPIWaitallOpLowering : public OpRewritePattern<enzymexla::MPIWaitallOp> {
         auto funcType = LLVM::LLVMFunctionType::get(
             i32Type, {i32Type, llvmPtrType, llvmPtrType}, false);
 
-        rewriter.create<LLVM::LLVMFuncOp>(op.getLoc(), mpiFunctionName,
-                                          funcType, LLVM::Linkage::External);
+        LLVM::LLVMFuncOp::create(rewriter, op.getLoc(), mpiFunctionName,
+                                 funcType, LLVM::Linkage::External);
       }
 
       // Get all orinigal op operands
       auto opOperands = op.getOperands();
 
       // Call the LLVM function with enzymexla.jit_call
-      rewriter.create<enzymexla::JITCallOp>(
-          op.getLoc(), TypeRange{},
+      enzymexla::JITCallOp::create(
+          rewriter, op.getLoc(), TypeRange{},
           mlir::FlatSymbolRefAttr::get(context, wrapperFunctionName),
           ValueRange{opOperands}, rewriter.getStringAttr(""),
           /*operand_layouts=*/nullptr,
-          /*result_layouts=*/nullptr,
           /*arg_attrs=*/nullptr,
           /*res_attrs=*/nullptr,
           /*output_operand_aliases=*/nullptr,
@@ -1377,9 +1404,11 @@ struct MPIAllreduceOpLowering
     : public OpRewritePattern<enzymexla::MPIAllreduceOp> {
 
   std::string backend;
-  MPIAllreduceOpLowering(std::string backend, MLIRContext *context,
-                         PatternBenefit benefit = 1)
-      : OpRewritePattern(context, benefit), backend(backend) {}
+  size_t ncclCommPtr;
+  MPIAllreduceOpLowering(std::string backend, size_t ncclCommPtr,
+                         MLIRContext *context, PatternBenefit benefit = 1)
+      : OpRewritePattern(context, benefit), backend(backend),
+        ncclCommPtr(ncclCommPtr) {}
 
   LogicalResult matchAndRewrite(enzymexla::MPIAllreduceOp op,
                                 PatternRewriter &rewriter) const override {
@@ -1419,8 +1448,8 @@ struct MPIAllreduceOpLowering
         auto funcType = LLVM::LLVMFunctionType::get(
             llvmVoidType, {llvmPtrType, llvmPtrType, llvmPtrType}, false);
 
-        auto wrapperFunc = rewriter.create<LLVM::LLVMFuncOp>(
-            op.getLoc(), wrapperFunctionName, funcType);
+        auto wrapperFunc = LLVM::LLVMFuncOp::create(
+            rewriter, op.getLoc(), wrapperFunctionName, funcType);
 
         // Add function-level memory effects attribute
         auto memoryEffectsAttr = rewriter.getArrayAttr(
@@ -1445,33 +1474,33 @@ struct MPIAllreduceOpLowering
 
         // Load the count value
         Value count =
-            rewriter.create<LLVM::LoadOp>(op.getLoc(), i32Type, countPtr);
+            LLVM::LoadOp::create(rewriter, op.getLoc(), i32Type, countPtr);
 
         // Get the address of the datatype
         // NOTE these symbols are not ABI-stable until MPI 5.0, but in practice,
         // they are represented as w ord-size values (i.e. `int` or ptr)
-        Value addressOfDtype = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, datatypeName);
+        Value addressOfDtype = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, datatypeName);
 
         // Get the address of the communicator
-        Value addressOfComm = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, communicatorName);
+        Value addressOfComm = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, communicatorName);
 
         // Get the address of the MPI Op
-        Value addressOfMPIOp = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, mpiOpName);
+        Value addressOfMPIOp = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, mpiOpName);
 
         // Call MPI_Allreduce
         // int MPI_Allreduce(const void* sendbuf, void* recvbuf, int count,
         //     MPI_Datatype datatype, MPI_Op op, MPI_Comm comm)
         // TODO returns i32 error code which we're ignoring here
-        rewriter.create<LLVM::CallOp>(
-            op.getLoc(), TypeRange{i32Type},
-            SymbolRefAttr::get(context, mpiFunctionName),
-            ValueRange{sendbufPtr, inbufPtr, count, addressOfDtype,
-                       addressOfMPIOp, addressOfComm});
+        LLVM::CallOp::create(rewriter, op.getLoc(), TypeRange{i32Type},
+                             SymbolRefAttr::get(context, mpiFunctionName),
+                             ValueRange{sendbufPtr, inbufPtr, count,
+                                        addressOfDtype, addressOfMPIOp,
+                                        addressOfComm});
 
-        rewriter.create<LLVM::ReturnOp>(op.getLoc(), ValueRange{});
+        LLVM::ReturnOp::create(rewriter, op.getLoc(), ValueRange{});
       }
 
       // Insert MPI_Allreduce function declaration if not already present
@@ -1485,8 +1514,8 @@ struct MPIAllreduceOpLowering
                                          llvmPtrType, llvmPtrType, llvmPtrType},
                                         false);
 
-        rewriter.create<LLVM::LLVMFuncOp>(op.getLoc(), mpiFunctionName,
-                                          funcType, LLVM::Linkage::External);
+        LLVM::LLVMFuncOp::create(rewriter, op.getLoc(), mpiFunctionName,
+                                 funcType, LLVM::Linkage::External);
       }
 
       // Insert MPI_COMM_WORLD declaration if not already present
@@ -1494,12 +1523,12 @@ struct MPIAllreduceOpLowering
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(
-            op.getLoc(), llvmPtrType,
-            /*isConstant=*/true, LLVM::Linkage::External, communicatorName,
-            /*value=*/Attribute(),
-            /*alignment=*/0,
-            /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               communicatorName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Insert datatype declaration if not already present
@@ -1507,12 +1536,12 @@ struct MPIAllreduceOpLowering
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(op.getLoc(), llvmPtrType,
-                                        /*isConstant=*/true,
-                                        LLVM::Linkage::External, datatypeName,
-                                        /*value=*/Attribute(),
-                                        /*alignment=*/0,
-                                        /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               datatypeName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Insert MPI_Op declaration if not already present
@@ -1520,12 +1549,12 @@ struct MPIAllreduceOpLowering
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(op.getLoc(), llvmPtrType,
-                                        /*isConstant=*/true,
-                                        LLVM::Linkage::External, mpiOpName,
-                                        /*value=*/Attribute(),
-                                        /*alignment=*/0,
-                                        /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               mpiOpName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Get all orinigal op operands
@@ -1540,12 +1569,11 @@ struct MPIAllreduceOpLowering
           /*operand_tuple_indices=*/std::vector<int64_t>{}));
 
       // Call the LLVM function with enzymexla.jit_call
-      auto jitCall = rewriter.create<enzymexla::JITCallOp>(
-          op.getLoc(), op->getResultTypes(),
+      auto jitCall = enzymexla::JITCallOp::create(
+          rewriter, op.getLoc(), op->getResultTypes(),
           mlir::FlatSymbolRefAttr::get(context, wrapperFunctionName),
           ValueRange{operands}, rewriter.getStringAttr(""),
           /*operand_layouts=*/nullptr,
-          /*result_layouts=*/nullptr,
           /*arg_attrs=*/nullptr,
           /*res_attrs=*/nullptr,
           /*output_operand_aliases=*/rewriter.getArrayAttr(aliases),
@@ -1554,6 +1582,138 @@ struct MPIAllreduceOpLowering
       rewriter.replaceOp(op, jitCall);
 
       return success();
+
+    } else if (backend == "cuda") {
+
+      auto moduleOp = op->getParentOfType<ModuleOp>();
+      auto sendbufType = cast<RankedTensorType>(op.getOperand(0).getType());
+      auto llvmPtrType = LLVM::LLVMPointerType::get(context);
+      auto llvmVoidType = LLVM::LLVMVoidType::get(context);
+      auto i32Type = IntegerType::get(context, 32);
+      auto i64Type = IntegerType::get(context, 64);
+
+      std::string ncclFunctionName = "ncclAllReduce";
+
+      auto datatype = op.getDatatype();
+      StringRef datatypeName = stringifyMPIDatatype(datatype);
+      auto ncclDatatype = mapMPIToNCCLDatatype(datatype);
+
+      auto mpiOp = op.getOp();
+      StringRef mpiOpName = stringifyMPIOp(mpiOp);
+      auto ncclRedOp = mapMPIToNCCLRedOp(mpiOp);
+
+      // Generate the enzymexla_wrapper LLVM function body
+      std::string wrapperFunctionName =
+          "enzymexla_wrapper_" + ncclFunctionName + "_" + mpiOpName.str() +
+          "_" + datatypeName.str();
+
+      if (!moduleOp.lookupSymbol<LLVM::LLVMFuncOp>(wrapperFunctionName)) {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(moduleOp.getBody());
+
+        // Create the wrapper function decl
+        auto funcType = LLVM::LLVMFunctionType::get(
+            llvmVoidType, {llvmPtrType, llvmPtrType}, false);
+
+        auto wrapperFunc = rewriter.create<LLVM::LLVMFuncOp>(
+            op.getLoc(), wrapperFunctionName, funcType);
+
+        // Add function-level memory effects attribute
+        auto memoryEffectsAttr = rewriter.getArrayAttr(
+            {rewriter.getStringAttr("read"), rewriter.getStringAttr("write"),
+             rewriter.getStringAttr("allocate"),
+             rewriter.getStringAttr("free")});
+        wrapperFunc->setAttr("enzymexla.memory_effects", memoryEffectsAttr);
+        wrapperFunc->setAttr("enzymexla.device_abi",
+                             rewriter.getStringAttr("cuda"));
+
+        Block *entryBlock = wrapperFunc.addEntryBlock(rewriter);
+        rewriter.setInsertionPointToStart(entryBlock);
+
+        // Add argument-level memory effects attribute to all arguments
+        for (unsigned i = 0; i < 2; ++i) {
+          wrapperFunc.setArgAttr(i, "enzymexla.memory_effects",
+                                 memoryEffectsAttr);
+        }
+
+        // Get the function arguments
+        Value sendbufPtr = entryBlock->getArgument(0);
+        Value recvbufPtr = entryBlock->getArgument(1);
+
+        Value count = rewriter.create<LLVM::ConstantOp>(
+            op.getLoc(), i64Type,
+            rewriter.getI64IntegerAttr(sendbufType.getNumElements()));
+
+        Value dtype = rewriter.create<LLVM::ConstantOp>(
+            op.getLoc(), i32Type, rewriter.getI32IntegerAttr(*ncclDatatype));
+
+        // Get the address of the communicator
+        Value ncclCommInt = rewriter.create<LLVM::ConstantOp>(
+            op.getLoc(), i64Type, rewriter.getI64IntegerAttr(ncclCommPtr));
+        Value ncclComm = rewriter.create<LLVM::IntToPtrOp>(
+            op.getLoc(), llvmPtrType, ncclCommInt);
+
+        Value redOp = rewriter.create<LLVM::ConstantOp>(
+            op.getLoc(), i32Type, rewriter.getI32IntegerAttr(*ncclRedOp));
+
+        Value stream =
+            enzymexla::GetStreamOp::create(rewriter, op.getLoc(), llvmPtrType);
+
+        Value sendDataPtr =
+            rewriter.create<LLVM::LoadOp>(op.getLoc(), llvmPtrType, sendbufPtr);
+        Value recvDataPtr =
+            rewriter.create<LLVM::LoadOp>(op.getLoc(), llvmPtrType, recvbufPtr);
+
+        // Call ncclAllReduce
+        // TODO error handling
+        rewriter.create<LLVM::CallOp>(
+            op.getLoc(), TypeRange{i32Type},
+            SymbolRefAttr::get(context, ncclFunctionName),
+            ValueRange{sendDataPtr, recvDataPtr, count, dtype, redOp, ncclComm,
+                       stream});
+
+        rewriter.create<LLVM::ReturnOp>(op.getLoc(), ValueRange{});
+      }
+
+      // Insert ncclAllReduce function declaration if not already present
+      if (!moduleOp.lookupSymbol<LLVM::LLVMFuncOp>(ncclFunctionName)) {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(moduleOp.getBody());
+
+        auto funcType = LLVM::LLVMFunctionType::get(i32Type,
+                                                    {llvmPtrType, llvmPtrType,
+                                                     i64Type, i32Type, i32Type,
+                                                     llvmPtrType, llvmPtrType},
+                                                    false);
+
+        rewriter.create<LLVM::LLVMFuncOp>(op.getLoc(), ncclFunctionName,
+                                          funcType, LLVM::Linkage::External);
+      }
+
+      Value operands[] = {op.getOperand(0), op.getOperand(1)};
+
+      // Add inbuf to output operand aliases
+      SmallVector<Attribute> aliases;
+      aliases.push_back(stablehlo::OutputOperandAliasAttr::get(
+          context,
+          /*output_operand_aliases=*/std::vector<int64_t>{},
+          /*operand_index=*/1,
+          /*operand_tuple_indices=*/std::vector<int64_t>{}));
+
+      auto jitCall = rewriter.create<enzymexla::JITCallOp>(
+          op.getLoc(), op->getResultTypes(),
+          mlir::FlatSymbolRefAttr::get(context, wrapperFunctionName),
+          ValueRange{operands}, rewriter.getStringAttr(""),
+          /*operand_layouts=*/nullptr,
+          /*arg_attrs=*/nullptr,
+          /*res_attrs=*/nullptr,
+          /*output_operand_aliases=*/rewriter.getArrayAttr(aliases),
+          /*xla_side_effect_free=*/nullptr);
+
+      rewriter.replaceOp(op, jitCall);
+
+      return success();
+
     } else {
       return rewriter.notifyMatchFailure(op,
                                          "Backend not supported: " + backend);
@@ -1602,8 +1762,8 @@ struct MPIBcastOpLowering : public OpRewritePattern<enzymexla::MPIBcastOp> {
         auto funcType = LLVM::LLVMFunctionType::get(
             llvmVoidType, {llvmPtrType, llvmPtrType, llvmPtrType}, false);
 
-        auto wrapperFunc = rewriter.create<LLVM::LLVMFuncOp>(
-            op.getLoc(), wrapperFunctionName, funcType);
+        auto wrapperFunc = LLVM::LLVMFuncOp::create(
+            rewriter, op.getLoc(), wrapperFunctionName, funcType);
 
         // Add function-level memory effects attribute
         auto memoryEffectsAttr = rewriter.getArrayAttr(
@@ -1628,31 +1788,31 @@ struct MPIBcastOpLowering : public OpRewritePattern<enzymexla::MPIBcastOp> {
 
         // Load the count and root values
         Value count =
-            rewriter.create<LLVM::LoadOp>(op.getLoc(), i32Type, countPtr);
+            LLVM::LoadOp::create(rewriter, op.getLoc(), i32Type, countPtr);
 
         Value root =
-            rewriter.create<LLVM::LoadOp>(op.getLoc(), i32Type, rootPtr);
+            LLVM::LoadOp::create(rewriter, op.getLoc(), i32Type, rootPtr);
 
         // Get the address of the datatype
         // NOTE these symbols are not ABI-stable until MPI 5.0, but in practice,
         // they are represented as word-size values (i.e. `int` or ptr)
-        Value addressOfDtype = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, datatypeName);
+        Value addressOfDtype = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, datatypeName);
 
         // Get the address of the communicator
-        Value addressOfComm = rewriter.create<LLVM::AddressOfOp>(
-            op.getLoc(), llvmPtrType, communicatorName);
+        Value addressOfComm = LLVM::AddressOfOp::create(
+            rewriter, op.getLoc(), llvmPtrType, communicatorName);
 
         // Call MPI_Bcast
         // int MPI_Bcast(void* buffer, int count, MPI_Datatype datatype,
         //     int root, MPI_Comm comm)
         // TODO returns i32 error code which we're ignoring here
-        rewriter.create<LLVM::CallOp>(
-            op.getLoc(), TypeRange{i32Type},
+        LLVM::CallOp::create(
+            rewriter, op.getLoc(), TypeRange{i32Type},
             SymbolRefAttr::get(context, mpiFunctionName),
             ValueRange{bufPtr, count, addressOfDtype, root, addressOfComm});
 
-        rewriter.create<LLVM::ReturnOp>(op.getLoc(), ValueRange{});
+        LLVM::ReturnOp::create(rewriter, op.getLoc(), ValueRange{});
       }
 
       // Insert MPI_Bcast function declaration if not already present
@@ -1664,8 +1824,8 @@ struct MPIBcastOpLowering : public OpRewritePattern<enzymexla::MPIBcastOp> {
             i32Type, {llvmPtrType, i32Type, llvmPtrType, i32Type, llvmPtrType},
             false);
 
-        rewriter.create<LLVM::LLVMFuncOp>(op.getLoc(), mpiFunctionName,
-                                          funcType, LLVM::Linkage::External);
+        LLVM::LLVMFuncOp::create(rewriter, op.getLoc(), mpiFunctionName,
+                                 funcType, LLVM::Linkage::External);
       }
 
       // Insert MPI_COMM_WORLD declaration if not already present
@@ -1673,12 +1833,12 @@ struct MPIBcastOpLowering : public OpRewritePattern<enzymexla::MPIBcastOp> {
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(
-            op.getLoc(), llvmPtrType,
-            /*isConstant=*/true, LLVM::Linkage::External, communicatorName,
-            /*value=*/Attribute(),
-            /*alignment=*/0,
-            /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               communicatorName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Insert datatype declaration if not already present
@@ -1686,12 +1846,12 @@ struct MPIBcastOpLowering : public OpRewritePattern<enzymexla::MPIBcastOp> {
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-        rewriter.create<LLVM::GlobalOp>(op.getLoc(), llvmPtrType,
-                                        /*isConstant=*/true,
-                                        LLVM::Linkage::External, datatypeName,
-                                        /*value=*/Attribute(),
-                                        /*alignment=*/0,
-                                        /*addrSpace=*/0);
+        LLVM::GlobalOp::create(rewriter, op.getLoc(), llvmPtrType,
+                               /*isConstant=*/true, LLVM::Linkage::External,
+                               datatypeName,
+                               /*value=*/Attribute(),
+                               /*alignment=*/0,
+                               /*addrSpace=*/0);
       }
 
       // Get all original op operands
@@ -1706,12 +1866,11 @@ struct MPIBcastOpLowering : public OpRewritePattern<enzymexla::MPIBcastOp> {
           /*operand_tuple_indices=*/std::vector<int64_t>{}));
 
       // Call the LLVM function with enzymexla.jit_call
-      auto jitCall = rewriter.create<enzymexla::JITCallOp>(
-          op.getLoc(), op->getResultTypes(),
+      auto jitCall = enzymexla::JITCallOp::create(
+          rewriter, op.getLoc(), op->getResultTypes(),
           mlir::FlatSymbolRefAttr::get(context, wrapperFunctionName),
           ValueRange{operands}, rewriter.getStringAttr(""),
           /*operand_layouts=*/nullptr,
-          /*result_layouts=*/nullptr,
           /*arg_attrs=*/nullptr,
           /*res_attrs=*/nullptr,
           /*output_operand_aliases=*/rewriter.getArrayAttr(aliases),
@@ -1732,7 +1891,101 @@ struct LowerEnzymeXLAMPIPass
   using Base::Base;
 
   void runOnOperation() override {
-    auto context = getOperation()->getContext();
+    // TODO: declare LowerEnzymeXLAMPIPass as a ModuleOp pass in Passes.td
+    // so getOperation() has the right static type here.
+    ModuleOp module = dyn_cast<ModuleOp>(getOperation());
+    if (!module) {
+      getOperation()->emitError()
+          << "lower-enzymexla-mpi must run on a builtin.module";
+      signalPassFailure();
+      return;
+    }
+
+    auto context = module->getContext();
+
+    if (backend == "cuda" && !ncclCommPtr) {
+      if (module
+              .walk([&](Operation *op) -> WalkResult {
+                if (isa<enzymexla::MPIBarrierOp, enzymexla::MPISendOp,
+                        enzymexla::MPIRecvOp, enzymexla::MPIIsendOp,
+                        enzymexla::MPIIrecvOp, enzymexla::MPIWaitOp,
+                        enzymexla::MPIWaitallOp, enzymexla::MPIAllreduceOp,
+                        enzymexla::MPIBcastOp>(op)) {
+                  return WalkResult::interrupt();
+                }
+                return WalkResult::advance();
+              })
+              .wasInterrupted()) {
+        module.emitError() << "lower-enzymexla-mpi with backend=cuda requires "
+                              "a valid NCCL communicator pointer";
+        signalPassFailure();
+        return;
+      }
+    }
+
+    if (backend == "cuda") {
+      bool hasUnsupportedMPIOp = false;
+      module.walk([&](Operation *op) {
+        if (isa<enzymexla::MPICommRankOp, enzymexla::MPICommSizeOp,
+                enzymexla::MPIBarrierOp, enzymexla::MPISendOp,
+                enzymexla::MPIRecvOp, enzymexla::MPIIsendOp,
+                enzymexla::MPIIrecvOp, enzymexla::MPIWaitOp,
+                enzymexla::MPIWaitallOp, enzymexla::MPIBcastOp>(op)) {
+          op->emitError() << "MPI operation not supported by backend cuda";
+          hasUnsupportedMPIOp = true;
+        }
+      });
+      if (hasUnsupportedMPIOp) {
+        signalPassFailure();
+        return;
+      }
+
+      bool hasUnsupportedAllreduce = false;
+      module.walk([&](enzymexla::MPIAllreduceOp op) {
+        auto sendbufType =
+            dyn_cast<RankedTensorType>(op.getOperand(0).getType());
+        auto recvbufType =
+            dyn_cast<RankedTensorType>(op.getOperand(1).getType());
+        if (!sendbufType || !sendbufType.hasStaticShape()) {
+          op.emitError() << "CUDA NCCL allreduce lowering requires statically "
+                            "shaped sendbuf to derive the element count";
+          hasUnsupportedAllreduce = true;
+          return;
+        }
+        if (!recvbufType || !recvbufType.hasStaticShape()) {
+          op.emitError() << "CUDA NCCL allreduce lowering requires statically "
+                            "shaped recvbuf to validate the element count";
+          hasUnsupportedAllreduce = true;
+          return;
+        }
+        if (sendbufType.getShape() != recvbufType.getShape()) {
+          op.emitError() << "CUDA NCCL allreduce lowering requires sendbuf and "
+                            "recvbuf to have the same shape";
+          hasUnsupportedAllreduce = true;
+          return;
+        }
+
+        auto datatype = op.getDatatype();
+        if (failed(mapMPIToNCCLDatatype(datatype))) {
+          op.emitError() << "MPI datatype not supported by NCCL lowering: "
+                         << stringifyMPIDatatype(datatype);
+          hasUnsupportedAllreduce = true;
+          return;
+        }
+
+        auto mpiOp = op.getOp();
+        if (failed(mapMPIToNCCLRedOp(mpiOp))) {
+          op.emitError() << "MPI reduction op not supported by NCCL lowering: "
+                         << stringifyMPIOp(mpiOp);
+          hasUnsupportedAllreduce = true;
+        }
+      });
+      if (hasUnsupportedAllreduce) {
+        signalPassFailure();
+        return;
+      }
+    }
+
     RewritePatternSet patterns(context);
 
     patterns.add<MPICommRankOpLowering>(backend, context);
@@ -1744,13 +1997,12 @@ struct LowerEnzymeXLAMPIPass
     patterns.add<MPIIrecvOpLowering>(backend, context);
     patterns.add<MPIWaitOpLowering>(backend, context);
     patterns.add<MPIWaitallOpLowering>(backend, context);
-    patterns.add<MPIAllreduceOpLowering>(backend, context);
+    patterns.add<MPIAllreduceOpLowering>(backend, ncclCommPtr, context);
     patterns.add<MPIBcastOpLowering>(backend, context);
 
     GreedyRewriteConfig config;
     config.enableFolding();
-    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns),
-                                     config))) {
+    if (failed(applyPatternsGreedily(module, std::move(patterns), config))) {
       signalPassFailure();
     }
   }

@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 #pragma once
 
+#include "mlir/IR/IRMapping.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 
@@ -49,26 +50,36 @@ struct WhileLoopInfo {
 
   mlir::Value getStart() { return start; }
 
-  mlir::Value getStep(OpBuilder &builder);
+  mlir::Value getLimit() { return limit; }
 
-  // assumes computeInfo() has been called and was successful
-  // returns the induction variable in the body of the while op
-  Value getInductionVariable() {
+  mlir::Value getStep(OpBuilder &builder, const IRMapping &mapping = {});
+
+  // returns the arg number of the iv. assumes computeInfo() has been called and
+  // was successful
+  size_t getArgNumber() {
     auto &condBlk = op.getCond().front();
     auto condTerm = cast<stablehlo::ReturnOp>(condBlk.getTerminator());
     auto condV = condTerm->getOperand(0);
     auto cond = condV.getDefiningOp<stablehlo::CompareOp>();
     if (!cond ||
         cond.getComparisonDirection() != stablehlo::ComparisonDirection::LT) {
-      return nullptr;
+      return -1;
     }
     auto induct = dyn_cast<BlockArgument>(cond.getOperand(0));
-    auto blockArgNum = induct.getArgNumber();
-    return op.getBody().front().getArgument(blockArgNum);
+    size_t blockArgNum = induct.getArgNumber();
+    return blockArgNum;
+  }
+
+  // assumes computeInfo() has been called and was successful
+  // returns the induction variable in the body of the while op
+  Value getInductionVariable() {
+    auto blockArgNum = getArgNumber();
+    return blockArgNum == -1 ? nullptr
+                             : op.getBody().front().getArgument(blockArgNum);
   }
 
   int64_t getConstantNumIters();
-  Value getNumIters(OpBuilder &builder);
+  Value getNumIters(OpBuilder &builder, const IRMapping &mapping = {});
 
   void propagateAffineIndexInfo();
   void propagateAffineIndexInfo(Value v, AffineIndexInfo curInfo,
@@ -84,7 +95,7 @@ struct WhileLoopInfo {
     return affineIndexInfo;
   }
 
-  llvm::DenseMap<Value, Bounds> &getBoundsMap() { return boundsMap; }
+  llvm::MapVector<Value, Bounds> &getBoundsMap() { return boundsMap; }
 
   unsigned getBoundsBitWidth() const { return boundsBitWidth; }
 
@@ -93,8 +104,29 @@ struct WhileLoopInfo {
                                   SmallVector<Operation *> &canBeHoisted,
                                   bool checkOperands = true);
 
+private:
+  // The walk over a value's operands, carrying the values it has already
+  // found to vary with the iteration. Reaching one again over another path
+  // gives the same answer, and the branch that said so records nothing, so
+  // the answer is remembered rather than recomputed: a shared subgraph is
+  // otherwise walked once per path that reaches it. The set lives for one
+  // call, since the IR may change between calls.
+  bool isConstantAcrossIterations(Value v, Value &outerValue,
+                                  SmallVector<Operation *> &canBeHoisted,
+                                  bool checkOperands, DenseSet<Value> &varies);
+
+public:
   bool canHoistOperationFromLoop(mlir::stablehlo::DynamicSliceOp sliceOp,
                                  SmallVectorImpl<int64_t> &dimensions);
+  // Whether hoisting `sliceOp` over `dimensions` out of the loop can succeed,
+  // including that the region it sweeps fits `operand`. Pure: callers decide
+  // with it before creating any op, so a refused hoist leaves nothing behind.
+  bool canHoistOperationFromLoop(Value operand,
+                                 mlir::stablehlo::DynamicSliceOp sliceOp,
+                                 SmallVectorImpl<int64_t> &dimensions);
+  bool slicedRegionFitsOperand(Value operand,
+                               mlir::stablehlo::DynamicSliceOp sliceOp,
+                               int64_t sliceIndex);
   bool hoistOperationFromLoop(OpBuilder &builder, Value operand,
                               mlir::stablehlo::DynamicSliceOp sliceOp,
                               int64_t sliceIndex, Value &result);
@@ -130,7 +162,7 @@ private:
   llvm::MapVector<Value, AffineIndexInfo> affineIndexInfo;
   DenseSet<Value> affineIndexPropagationVisited;
 
-  llvm::DenseMap<Value, Bounds> boundsMap;
+  llvm::MapVector<Value, Bounds> boundsMap;
   unsigned int boundsBitWidth;
 
   std::optional<Bounds> computeBounds(Operation *op);
