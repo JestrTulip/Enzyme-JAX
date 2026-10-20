@@ -155,6 +155,8 @@ struct KernelCallToGPUWrapperPass
       region.setResultAttrsAttr(resAttrs);
     if (call.getXlaSideEffectFree())
       region.setXlaSideEffectFree(true);
+    if (call.getCmdBufferCompatible())
+      region.setCmdBufferCompatible(true);
     {
       OpBuilder::InsertionGuard guard(builder);
       builder.createBlock(

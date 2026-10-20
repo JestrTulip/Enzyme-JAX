@@ -278,7 +278,8 @@ struct GPUWrapperToKernelCallPass
         /*backend_config=*/builder.getStringAttr(""),
         operandLayouts, /*arg_attrs=*/nullptr,
         /*res_attrs=*/nullptr, ArrayAttr::get(ctx, aliases),
-        /*xla_side_effect_free=*/nullptr);
+        /*xla_side_effect_free=*/nullptr,
+        /*cmd_buffer_compatible=*/nullptr);
   }
 
   // Replaces a jit_region by the kernel_calls of the kernels it launches,
@@ -345,6 +346,8 @@ struct GPUWrapperToKernelCallPass
             builder, launch, operands, operandLayouts, symbolTables);
         if (failed(call))
           return failure();
+        if (region.getCmdBufferCompatible())
+          call->setCmdBufferCompatibleAttr(builder.getUnitAttr());
         for (auto [buffer, result] :
              llvm::zip_equal(buffers, call->getResults()))
           contents[buffer] = result;

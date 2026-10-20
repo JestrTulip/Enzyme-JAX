@@ -260,7 +260,8 @@ def JITRegionOp : EnzymeXLA_Op<"jit_region", [
     OptionalAttr<DictArrayAttr>:$result_attrs,
     DefaultValuedOptionalAttr<
         ArrayAttr, "{}">:$output_operand_aliases,
-    OptionalAttr<UnitAttr>:$xla_side_effect_free
+    OptionalAttr<UnitAttr>:$xla_side_effect_free,
+    OptionalAttr<UnitAttr>:$cmd_buffer_compatible
   );
   let results = (outs Variadic<HLO_Tensor>);
   let regions = (region SizedRegion<1>:$body);
