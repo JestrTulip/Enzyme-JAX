@@ -275,11 +275,11 @@ struct GPUWrapperToKernelCallPass
         builder, launch.getLoc(), operands.getTypes(),
         SymbolRefAttr::get(fn.getSymNameAttr()), gridx, gridy, gridz, blockx,
         blocky, blockz, shmem, clusterx, clustery, clusterz, operands,
-        /*backend_config=*/builder.getStringAttr(""),
-        operandLayouts, /*arg_attrs=*/nullptr,
+        /*backend_config=*/builder.getStringAttr(""), operandLayouts,
+        /*arg_attrs=*/nullptr,
         /*res_attrs=*/nullptr, ArrayAttr::get(ctx, aliases),
         /*xla_side_effect_free=*/nullptr,
-        /*cmd_buffer_compatible=*/nullptr);
+        /*cmd_buffer_compatible=*/builder.getUnitAttr());
   }
 
   // Replaces a jit_region by the kernel_calls of the kernels it launches,
